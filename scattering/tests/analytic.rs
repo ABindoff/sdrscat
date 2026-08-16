@@ -118,13 +118,17 @@ fn positive_and_negative_offsets_are_distinguished() {
 /// This is the documented limitation, verified rather than assumed.
 #[test]
 fn resolution_follows_the_stated_bandwidth() {
-    let cfg = config();
-    let sa = Scattering::new(cfg, N);
-    let axis = sa.lambda1_hz();
+    let sa = Scattering::new(config(), N);
 
     let centre = 200e3;
-    let rbw = sa.rbw_hz(centre); // = centre / q1
-    assert!((rbw - centre / cfg.q1).abs() < 1e-9);
+    let rbw = sa.rbw_hz(centre);
+
+    // Well above the elbow the bank is constant-Q, so bandwidth is proportional
+    // to offset. Checked as a ratio rather than against `centre / q1`, because
+    // bandwidth is derived from the filter-crossing criterion and not set to
+    // that formula.
+    let ratio = sa.rbw_hz(2.0 * centre) / rbw;
+    assert!((ratio - 2.0).abs() < 0.05, "constant-Q region is not constant-Q: {ratio:.3}");
 
     // Well separated: three bandwidths apart.
     let x = synth::two_tone(N, FS, centre - 1.5 * rbw, 1.0, centre + 1.5 * rbw, 1.0);
@@ -135,8 +139,6 @@ fn resolution_follows_the_stated_bandwidth() {
     let x = synth::two_tone(N, FS, centre - 0.1 * rbw, 1.0, centre + 0.1 * rbw, 1.0);
     let out = sa.analyse(&x);
     assert_eq!(count_peaks(&out.s1_mean()), 1, "should not resolve at 0.2x RBW spacing");
-
-    let _ = axis;
 }
 
 /// Counts local maxima that rise at least 3 dB above their surrounding dips,
@@ -200,32 +202,27 @@ fn am_modulation_rate_and_depth_are_recovered() {
         );
 
         let axis1 = sa.lambda1_hz();
-        let axis2 = sa.lambda2_hz();
         let i1 = nearest(&axis1, 300e3);
 
         let x = synth::am(n, FS, axis1[i1], mod_hz, depth, 1.0);
         let out = sa.analyse(&x);
 
-        let m = out.modulation_depth();
-        let i2 = argmax(&m[i1]);
+        // The marker readout, which interpolates across neighbouring filters
+        // rather than trusting a single one. Interpolation is what lets both
+        // figures beat the grid spacing.
+        let (rate, read_depth) = out.modulation_peak(i1).unwrap();
 
-        // Tolerance is set by the filter spacing: at q2 filters per octave the
-        // grid steps by 2^(1/q2), so the nearest centre can be half that away.
-        let half_spacing_pct = 100.0 * (2f64.powf(0.5 / cfg.q2) - 1.0);
-        let rate_err_pct = 100.0 * (axis2[i2] - mod_hz).abs() / mod_hz;
+        let rate_err_pct = 100.0 * (rate - mod_hz).abs() / mod_hz;
         assert!(
-            rate_err_pct < half_spacing_pct + 1.0,
-            "modulation rate read {:.1} Hz, expected {mod_hz} Hz \
-             ({rate_err_pct:.1}% out, grid allows {half_spacing_pct:.1}%)",
-            axis2[i2]
+            rate_err_pct < 5.0,
+            "modulation rate read {rate:.1} Hz, expected {mod_hz} Hz ({rate_err_pct:.1}% out)"
         );
 
-        let depth_err_pct = 100.0 * (m[i1][i2] - depth).abs() / depth;
+        let depth_err_pct = 100.0 * (read_depth - depth).abs() / depth;
         assert!(
-            depth_err_pct < 15.0,
-            "modulation depth read {:.3}, expected {depth} ({depth_err_pct:.1}% out) \
-             at {mod_hz} Hz",
-            m[i1][i2]
+            depth_err_pct < 10.0,
+            "modulation depth read {read_depth:.3}, expected {depth} \
+             ({depth_err_pct:.1}% out) at {mod_hz} Hz"
         );
     }
 }
@@ -427,34 +424,85 @@ fn output_geometry_is_sane() {
     assert!(out.lambda2_hz.last().unwrap() <= &cfg.max_mod_hz);
 }
 
-/// A filter longer than the block cannot measure a low frequency, it can only
-/// measure circular wraparound. Those must be dropped, and the caller must be
-/// told, otherwise the bottom of the modulation display fills with convincing
-/// rubbish.
+/// An over-ambitious request must be met by widening the filters, not by
+/// abandoning the frequencies. The elbow is what makes that possible: below it
+/// bandwidth is pinned, so time support stops growing and coverage continues.
 #[test]
-fn filters_longer_than_the_block_are_dropped_and_reported() {
-    // Ask for far more modulation coverage than a 109 ms block can support:
-    // 14 octaves below 30 kHz reaches down to about 2 Hz, which would need a
-    // wavelet several seconds long.
+fn the_elbow_keeps_low_rates_at_bounded_cost() {
+    // Ask for far more modulation coverage than a 109 ms block could support
+    // under a purely constant-Q bank: 14 octaves below 30 kHz reaches about
+    // 2 Hz, which at Q = 4 would need a wavelet several seconds long.
+    let cfg = Config { max_mod_hz: 30_000.0, octaves2: 14.0, ..config() };
+    let sa = Scattering::new(cfg, N);
+    let cov = sa.coverage();
+    let block_s = N as f64 / FS;
+
+    let elbow = cov.elbow_mod_hz.expect("such a request must reach the elbow");
+    assert!(elbow > cov.min_mod_hz, "elbow must sit above the floor");
+
+    // Nothing below one cycle per block, which would be measuring wraparound.
+    assert!(
+        cov.min_mod_hz > 1.0 / block_s,
+        "kept a {:.1} Hz filter in a {block_s:.3} s block",
+        cov.min_mod_hz
+    );
+
+    // The edge margin still leaves a usable interior, which is the property the
+    // pinned bandwidth buys.
+    let out = sa.analyse(&synth::tone(N, FS, 300e3, 1.0));
+    assert!(2.0 * out.edge_margin_s < block_s);
+
+    // Above the elbow constant-Q holds: bandwidth scales with rate.
+    assert!(
+        sa.mod_rbw_hz(elbow * 4.0) > sa.mod_rbw_hz(elbow) * 2.0,
+        "bandwidth did not scale with rate above the elbow"
+    );
+
+    // Below it the bandwidth is pinned, so two different sub-elbow rates must
+    // report the same figure. Compared against each other rather than against
+    // the elbow filter itself, which is the last constant-Q one and so is still
+    // slightly wider than the floor.
+    let at_floor = sa.mod_rbw_hz(cov.min_mod_hz);
+    let midway = sa.mod_rbw_hz(0.5 * (cov.min_mod_hz + elbow));
+    assert!(
+        (at_floor - midway).abs() / midway < 1e-9,
+        "bandwidth was not pinned below the elbow: {at_floor:.3} vs {midway:.3} Hz"
+    );
+}
+
+/// The concrete payoff: 100 Hz modulation, the rate that matters for hunting
+/// mains-synchronous interference, is now reachable in a block that a purely
+/// constant-Q bank could not have managed.
+#[test]
+fn mains_rate_modulation_is_reachable_in_a_short_block() {
     let cfg = Config { max_mod_hz: 30_000.0, octaves2: 14.0, ..config() };
     let sa = Scattering::new(cfg, N);
     let cov = sa.coverage();
 
-    assert!(cov.dropped2 > 0, "over-ambitious request was not clamped");
-
-    // Whatever survived must genuinely fit inside the block.
-    let block_s = N as f64 / FS;
     assert!(
-        cov.min_mod_hz > 1.0 / block_s,
-        "kept a {:.1} Hz filter in a {:.3} s block",
+        cov.min_mod_hz <= 100.0,
+        "floor is {:.1} Hz in a {:.0} ms block, cannot see mains at 100 Hz",
         cov.min_mod_hz,
-        block_s
+        1e3 * N as f64 / FS
     );
 
-    // And the edge margin must now leave a usable interior.
+    // And it must actually measure it, not merely have a filter there.
+    let axis1 = sa.lambda1_hz();
+    let axis2 = sa.lambda2_hz();
+    let i1 = nearest(&axis1, 300e3);
+    let x = synth::am(N, FS, axis1[i1], 100.0, 0.5, 1.0);
+    let out = sa.analyse(&x);
 
-    let out = sa.analyse(&synth::tone(N, FS, 300e3, 1.0));
-    assert!(2.0 * out.edge_margin_s < block_s);
+    let m = out.modulation_depth();
+    let i2 = argmax(&m[i1]);
+    // Below the elbow the filters are one bandwidth apart, so accept the read
+    // rate within the bandwidth of the filter that made it.
+    let tolerance = sa.mod_rbw_hz(100.0);
+    assert!(
+        (axis2[i2] - 100.0).abs() <= tolerance,
+        "read {:.1} Hz for a 100 Hz modulation (bandwidth there is {tolerance:.1} Hz)",
+        axis2[i2]
+    );
 }
 
 /// The sub-band shortcut must not change the answer. It filters each band at
@@ -515,7 +563,11 @@ fn subband_shortcut_matches_full_rate_filtering() {
 /// than by trial and error.
 #[test]
 fn block_length_prediction_is_honest() {
-    let cfg = Config { max_mod_hz: 30_000.0, octaves2: 16.0, ..config() };
+    // A short averaging window, so the wavelet length is the binding constraint
+    // for every target below. `block_len_for` also respects the averaging
+    // window, and if that dominated the tightness check below would be testing
+    // the wrong thing.
+    let cfg = Config { max_mod_hz: 30_000.0, octaves2: 16.0, invariance_s: 0.0005, ..config() };
 
     for target_hz in [30.0, 100.0, 400.0] {
         let needed = cfg.block_len_for(target_hz);
@@ -535,4 +587,43 @@ fn block_length_prediction_is_honest() {
             cov.min_mod_hz
         );
     }
+}
+
+/// The practical payoff of the whole change: block length no longer scales with
+/// `q2`. A sharper second-order bank used to cost proportionally more data to
+/// reach a given rate, because a narrower filter is a longer one. With the
+/// bandwidth pinned below the elbow, that proportionality is gone.
+///
+/// Not perfectly flat, and it should not be expected to be: the floor is
+/// quantised to one linear step and block lengths are rounded to powers of two,
+/// which together leave a doubling of slack. What must be gone is the *trend*.
+#[test]
+fn block_length_no_longer_scales_with_q2() {
+    let base = Config { max_mod_hz: 30_000.0, octaves2: 16.0, invariance_s: 0.0005, ..config() };
+    let qs = [2.0, 4.0, 8.0, 16.0];
+
+    let lengths: Vec<usize> = qs
+        .iter()
+        .map(|&q2| Config { q2, ..base }.block_len_for(100.0))
+        .collect();
+
+    // Every one of them must genuinely reach the target, whatever the
+    // quantisation did.
+    for (&q2, &n) in qs.iter().zip(lengths.iter()) {
+        let cov = Scattering::new(Config { q2, ..base }, n).coverage();
+        assert!(
+            cov.min_mod_hz <= 100.0,
+            "q2={q2} predicted {n} samples but reached only {:.1} Hz",
+            cov.min_mod_hz
+        );
+    }
+
+    // An 8x span of q2 must not produce an 8x span of block lengths. One
+    // doubling is quantisation; more than that is a surviving proportionality.
+    let lo = *lengths.iter().min().unwrap() as f64;
+    let hi = *lengths.iter().max().unwrap() as f64;
+    assert!(
+        hi / lo <= 2.0,
+        "block length still tracks q2 across an 8x span: {lengths:?}"
+    );
 }

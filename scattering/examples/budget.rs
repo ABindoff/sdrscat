@@ -67,7 +67,7 @@ fn main() {
     println!("\nFirst-order resolution bandwidth is constant-Q, so it widens with offset:");
     let cfg = Config::for_iq(fs);
     let sa = Scattering::new(cfg, 1 << 19);
-    for offset in [10e3, 100e3, 500e3, 1e6] {
+    for offset in [20e3, 100e3, 400e3, 900e3] {
         println!(
             "  at {:>7.0} kHz offset: RBW {:>8.1} kHz  (an FFT of the same block gives {:.1} Hz)",
             offset / 1e3,

@@ -18,17 +18,29 @@
 //! structure, modulation and transients. A spectrum analyser built on this
 //! crate should show both.
 //!
+//! # Two regimes
+//!
+//! A purely constant-Q bank cannot reach low frequencies in a finite block:
+//! time support grows as `1/xi` without bound. Following Anden and Mallat
+//! (2014), the bank is constant-Q only while bandwidth stays above a floor set
+//! by the block length, and below that elbow it becomes constant-*bandwidth*.
+//! Time support is then bounded by construction and coverage continues to near
+//! DC. The price is that `Q` falls with frequency down there, so
+//! [`Scattering::rbw_hz`] reads the resolution off the filter that actually
+//! measures rather than computing `f / Q`.
+//!
 //! # Block length is the binding constraint
 //!
-//! Resolving a modulation rate of `f` Hz at quality factor `Q` needs a wavelet
-//! about `6.4 Q / f` seconds long, and a block at least four times that so
-//! something survives trimming the contaminated edges. Seeing 100 Hz at
-//! `Q = 4` therefore takes roughly a second of I/Q, which at 2.4 MSa/s is a few
-//! million complex samples. That is a real constraint on any live display, not
-//! a tuning detail: ask [`Config::block_len_for`] rather than guessing, and
-//! read [`Scattering::coverage`] to find out what you actually got. Filters too
-//! long for the block are dropped rather than built, so an empty region of the
-//! display means "not measured", never "quiet".
+//! Reaching a modulation rate of `f` Hz needs a wavelet about `6.4 / f` seconds
+//! long, and a block at least four times that so something survives trimming
+//! the contaminated edges. Seeing 100 Hz therefore takes about a quarter-second
+//! of I/Q, which at 2.4 MSa/s is half a million complex samples. Because the
+//! elbow pins bandwidth, this no longer scales with `Q`: what `Q` buys is
+//! resolution at that rate, not access to it.
+//!
+//! That is a real constraint on any live display, not a tuning detail: ask
+//! [`Config::block_len_for`] rather than guessing, and read
+//! [`Scattering::coverage`] to find out what you actually got.
 //!
 //! # Example
 //!
@@ -68,5 +80,7 @@ pub mod synth;
 pub mod transform;
 
 pub use fft::Cf64;
-pub use filterbank::{min_xi_for_length, BankSpec, FilterBank, Wavelet};
+pub use filterbank::{
+    min_xi_for_length, sigma_min_for_length, BankSpec, FilterBank, Wavelet, DEFAULT_R,
+};
 pub use transform::{Config, Coverage, Scattergram, Scattering};

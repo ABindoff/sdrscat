@@ -32,7 +32,9 @@
 //! rate that still resolves `max_mod_hz`) and once after averaging.
 
 use crate::fft::{decimate_spectrum, power_of_two_factor, with_plans, Cf64, Plans};
-use crate::filterbank::{self, min_xi_for_length, BankSpec, FilterBank};
+use crate::filterbank::{
+    self, min_xi_for_length, sigma_min_for_length, BankSpec, FilterBank, DEFAULT_R,
+};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
@@ -151,24 +153,56 @@ impl Config {
     }
 
     /// Block length, in samples, needed before a modulation rate of
-    /// `min_mod_hz` can be resolved at quality factor `q2`.
+    /// `min_mod_hz` appears in the second order at all.
     ///
-    /// Takes the larger of two constraints, the second-order wavelet length and
-    /// the averaging window, and rounds up to a power of two. The dependence on
+    /// Takes the larger of two constraints, the wavelet length and the
+    /// averaging window, and rounds up to a power of two. The dependence on
     /// rate is inverse: seeing 10 Hz costs ten times the block that seeing
-    /// 100 Hz does, and no amount of processing evades it. This is the
-    /// calculation to run before wondering why the bottom of the modulation
-    /// display is empty.
+    /// 100 Hz does, and no amount of processing evades it.
+    ///
+    /// Since the bank turns constant-bandwidth below the elbow, this no longer
+    /// scales with `q2`. What `q2` still buys is *resolution* at that rate:
+    /// reaching 50 Hz is one question, resolving 50 Hz from 55 Hz is another,
+    /// and only the second gets harder as `q2` rises. Check
+    /// [`Scattering::rbw_hz`] for what the filter down there is actually doing.
     pub fn block_len_for(&self, min_mod_hz: f64) -> usize {
         // Wavelets are built on the grid decimated by d1, so the requirement is
         // expressed there and then scaled back up.
         let d1 = power_of_two_factor(0.25 * self.fs / self.max_mod_hz, 1 << 30);
         let fs1 = self.fs / d1 as f64;
-        // min_xi_for_length inverted: n = C * q / xi.
-        let for_wavelet = min_xi_for_length(self.q2, 1) / (min_mod_hz / fs1) * d1 as f64;
+        let target_xi = min_mod_hz / fs1;
+
+        // min_xi_for_length is inversely proportional to n, so evaluating it at
+        // n = 1 gives the constant to divide by the target frequency.
+        let for_wavelet = min_xi_for_length(1) / target_xi * d1 as f64;
         let for_averaging =
             self.invariance_s * self.fs * AVERAGING_SUPPORT_FACTOR / MAX_SUPPORT_FRACTION;
-        (for_wavelet.max(for_averaging).ceil().max(1.0) as usize).next_power_of_two()
+        let mut n = (for_wavelet.max(for_averaging).ceil().max(1.0) as usize)
+            .next_power_of_two()
+            .max(d1);
+
+        // That estimate is the *bound*, not the achieved floor. Below the elbow
+        // the bank steps down by a fixed amount from wherever constant-Q
+        // stopped, so where it finally lands is quantised to within one step
+        // and the bound can be missed by that much. Rather than pad by a fudge
+        // factor, ask the plan the bank will actually build and double until it
+        // genuinely reaches. Planning is pure arithmetic, so this is cheap.
+        let spec = BankSpec {
+            q: self.q2,
+            r: DEFAULT_R,
+            xi_max: self.max_mod_hz / fs1,
+            octaves: self.octaves2,
+            two_sided: false,
+        };
+        for _ in 0..8 {
+            let plan = spec.plan(sigma_min_for_length(n / d1));
+            let floor = plan.last().map(|(xi, _)| *xi).unwrap_or(f64::INFINITY);
+            if floor <= target_xi {
+                break;
+            }
+            n *= 2;
+        }
+        n
     }
 }
 
@@ -184,10 +218,12 @@ pub struct Coverage {
     pub min_mod_hz: f64,
     /// Fastest modulation rate resolved, Hz.
     pub max_mod_hz: f64,
-    /// First-order filters requested but too long for the block.
-    pub dropped1: usize,
-    /// Second-order filters requested but too long for the block.
-    pub dropped2: usize,
+    /// Carrier frequency where the first-order bank stops being constant-Q,
+    /// in Hz, if the block was short enough to reach it.
+    pub elbow_carrier_hz: Option<f64>,
+    /// Modulation rate where the second-order bank stops being constant-Q, in
+    /// Hz, if the block was short enough to reach it.
+    pub elbow_mod_hz: Option<f64>,
     /// Output time-axis sample rate, Hz.
     pub out_rate_hz: f64,
     /// Block duration, seconds.
@@ -207,12 +243,11 @@ impl fmt::Display for Coverage {
             self.out_rate_hz,
             self.block_s * 1e3
         )?;
-        if self.dropped1 > 0 || self.dropped2 > 0 {
-            write!(
-                f,
-                " ({} carrier and {} modulation filters dropped as longer than the block)",
-                self.dropped1, self.dropped2
-            )?;
+        if let Some(hz) = self.elbow_carrier_hz {
+            write!(f, "; constant-Q down to {:.1} kHz carrier", hz / 1e3)?;
+        }
+        if let Some(hz) = self.elbow_mod_hz {
+            write!(f, "; constant-Q down to {hz:.0} Hz modulation")?;
         }
         Ok(())
     }
@@ -298,6 +333,45 @@ impl Scattergram {
         argmax(&self.s1_mean())
     }
 
+    /// Strongest modulation present in carrier band `i1`, as
+    /// `(rate in Hz, depth)`.
+    ///
+    /// Reading the single largest coefficient understates the depth by up to
+    /// 3 dB, because a rate falling midway between two filters excites each at
+    /// only `1/sqrt(2)`. That scalloping is not a defect to be tuned away: the
+    /// filters are deliberately spaced to cross there, which is what makes the
+    /// bank tile flat.
+    ///
+    /// Flat tiling is also the cure. For a single tone the squared responses of
+    /// all filters sum to one, so adding the neighbours in quadrature recovers
+    /// the true amplitude wherever the tone happens to fall. The rate is then
+    /// interpolated as the energy-weighted centroid in log frequency, which
+    /// beats the grid spacing rather than being limited by it.
+    ///
+    /// This is what a marker readout should call. Returns `None` if the second
+    /// order was not computed.
+    pub fn modulation_peak(&self, i1: usize) -> Option<(f64, f64)> {
+        let depth = self.modulation_depth();
+        let row = depth.get(i1)?;
+        let i2 = argmax(row)?;
+        if row[i2] <= 0.0 {
+            return Some((self.lambda2_hz.get(i2).copied().unwrap_or(0.0), 0.0));
+        }
+
+        let lo = i2.saturating_sub(1);
+        let hi = (i2 + 1).min(row.len() - 1);
+
+        let mut energy = 0.0;
+        let mut log_rate = 0.0;
+        for (v, rate) in row[lo..=hi].iter().zip(self.lambda2_hz[lo..=hi].iter()) {
+            let w = v * v;
+            energy += w;
+            log_rate += w * rate.ln();
+        }
+
+        Some((( log_rate / energy).exp(), energy.sqrt()))
+    }
+
     /// Output sample range excluding the contaminated edges.
     fn interior(&self) -> (usize, usize) {
         let margin = (self.edge_margin_s * self.out_rate_hz).ceil() as usize;
@@ -364,6 +438,7 @@ impl Scattering {
 
         let spec1 = BankSpec {
             q: config.q1,
+            r: DEFAULT_R,
             xi_max: config.xi1_max,
             octaves: config.octaves1,
             two_sided: config.complex_input,
@@ -382,6 +457,7 @@ impl Scattering {
         // negative modulation rates would be redundant.
         let spec2 = BankSpec {
             q: config.q2,
+            r: DEFAULT_R,
             xi_max: config.max_mod_hz / fs1,
             octaves: config.octaves2,
             two_sided: false,
@@ -474,19 +550,38 @@ impl Scattering {
             max_carrier_hz: l1.last().copied().unwrap_or(0.0).abs(),
             min_mod_hz: self.bank2.min_xi() * fs1,
             max_mod_hz: l2.last().copied().unwrap_or(0.0),
-            dropped1: self.bank1.dropped,
-            dropped2: self.bank2.dropped,
+            elbow_carrier_hz: self.bank1.elbow_xi.map(|xi| xi * self.config.fs),
+            elbow_mod_hz: self.bank2.elbow_xi.map(|xi| xi * fs1),
             out_rate_hz: self.out_rate_hz(),
             block_s: self.n as f64 / self.config.fs,
         }
     }
 
     /// Resolution bandwidth of the first-order analysis at a given carrier
-    /// offset, in Hz. Constant-Q, so this grows with frequency: that is the
-    /// central limitation of a scattering display versus an FFT one, and it is
-    /// worth showing the user explicitly.
+    /// offset, in Hz: the -3 dB width of the filter that actually measures
+    /// there.
+    ///
+    /// Read off the bank rather than computed as `offset / Q`, because that
+    /// formula holds only above the elbow. Below it the filters are constant
+    /// bandwidth and the true figure flattens out. A display should show this
+    /// number, since it is the difference between "these two signals are
+    /// genuinely one" and "my analyser cannot tell them apart".
     pub fn rbw_hz(&self, offset_hz: f64) -> f64 {
-        offset_hz.abs() / self.config.q1
+        let xi = offset_hz / self.config.fs;
+        match self.bank1.nearest(xi) {
+            Some(w) => w.bandwidth * self.config.fs,
+            None => f64::NAN,
+        }
+    }
+
+    /// Resolution bandwidth of the second-order analysis at a given modulation
+    /// rate, in Hz. Same story as [`Scattering::rbw_hz`], one order up.
+    pub fn mod_rbw_hz(&self, rate_hz: f64) -> f64 {
+        let fs1 = self.config.fs / self.d1 as f64;
+        match self.bank2.nearest(rate_hz / fs1) {
+            Some(w) => w.bandwidth * fs1,
+            None => f64::NAN,
+        }
     }
 
     /// Analyses one block. `x` must be exactly `block_len()` samples.
