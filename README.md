@@ -2,8 +2,7 @@
 
 A spectrum analyser for cheap SDR hardware, built around wavelet scattering.
 
-The name pairs with `wavscat`, the R package: wavscat is
-the transform, sdrscat is the instrument built on it.
+A hobby project, not affiliated with any institution.
 
 ## Layout
 
@@ -11,11 +10,11 @@ the transform, sdrscat is the instrument built on it.
 scattering/      pure Rust core, no I/O          <- built, validated
 sdr/             SoapySDR capture, sweep, stitch  (not started)
 sdrscat-app/     egui GUI                         (not started)
-wavscat-rs/      extendr shim to the R package    (not started)
 ```
 
-The core is deliberately free of hardware and platform dependencies so the R
-package and the desktop app can share one implementation and one test suite.
+The core is free of hardware and platform dependencies so it can be tested
+against synthetic signals without a radio attached, and so the GUI and any
+headless tooling share one implementation and one test suite.
 
 ## What the core does
 
@@ -119,4 +118,6 @@ above for the machine it runs on.
 2. `sdrscat-app/`: egui, two panes (Welch PSD and the scattering pair).
 3. tinySA over USB serial as a tracking generator, which gives both swept
    transmission measurement and the amplitude calibration table.
-4. `wavscat-rs/`: extendr wrapper so the R package uses this same core.
+4. Low-frequency filter bank: trade constant-Q for constant-bandwidth below an
+   elbow, so the modulation floor stops costing block length in direct
+   proportion. See Andén and Mallat (2014), doi:10.1109/TSP.2014.2326991.
