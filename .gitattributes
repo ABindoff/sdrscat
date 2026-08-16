@@ -1,0 +1,9 @@
+# Normalise to LF in the repository regardless of the platform committing.
+# This is authored on Windows but has to build on Linux and macOS.
+* text=auto eol=lf
+
+# Binary captures, should they ever be committed deliberately.
+*.iq binary
+*.cf32 binary
+*.cs8 binary
+*.sigmf-data binary

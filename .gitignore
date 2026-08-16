@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Session scratch from the repro-mcp hook
+/.repro/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Captured I/Q, which gets large fast and is never worth versioning
+*.iq
+*.cf32
+*.cs8
+*.sigmf-data

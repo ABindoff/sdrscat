@@ -1,0 +1,11 @@
+[package]
+name = "scattering"
+description = "Wavelet scattering transform for complex baseband (I/Q) and real signals"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustfft.workspace = true
+rayon.workspace = true
